@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <time.h>
 
 #include "hashmap.h"
 
@@ -23,6 +24,7 @@
 #define MAX_NAME_LEN 128
 #define MAX_BUF_LEN 2048
 #define MAX_CHUNK_LEN 8192
+#define CHUNK_CAPACITY (16 * 1024) // 16 KB chunk threshold
 
 typedef struct {
     char dir_path[MAX_PATH_LEN]; // path to the directory where the file resides
@@ -34,6 +36,8 @@ typedef struct {
     ino_t inode; // inode number for detecting file renaming
     dev_t dev; // device ID
     bool is_active; // whether the file exists currently on disk
+    char buffer[MAX_CHUNK_LEN]; // buffer to carry partial line chunks
+    size_t buf_len; // size of chunk present in the buffer
 } Trackedfile;
 
 typedef struct {
@@ -43,7 +47,16 @@ typedef struct {
 } TrackedDir;
 
 typedef struct {
+    char* data; // Pre-allocated contiguous byte buffer
+    size_t capacity; // Maximum size (e.g. 16384 bytes)
+    size_t length; // Current number of bytes written
+    size_t record_count; // Total log lines stored in this chunk
+    time_t created_at; // Timestamp when chunk was created (for time-based flush)
+} LogChunk;
+
+typedef struct {
     int inotify_fd; // the master inotify instance
+    LogChunk* active_chunk; // to process the log chunk arrived by the read call
     HashMap* files_by_wd; // Maps "wd:<int>" → Trackedfile* -> immediately grab the file upon IN_MODIFY
     HashMap* files_by_path; // Maps full path "/var/log/auth.log" → Trackedfile* -> used for dir events telling a file appeared or disappeared
     HashMap* dirs_by_wd; //  Maps "dir:<int>" → TrackedDir* -> immediately grab the directory upon a dir event
@@ -58,6 +71,12 @@ void tracked_file_destroy(Trackedfile* file);
 TrackedDir* tracked_dir_create(const char* dir_path);
 void tracked_dir_destroy(TrackedDir* dir);
 
+/* Lifecycle for LogChunk */
+LogChunk* log_chunk_create(size_t capacity);
+void log_chunk_destroy(LogChunk* lc);
+int log_chunk_append(LogChunk* lc, const char* record, size_t record_len); // returns 0 for success, 1 for chunk full, -1 for any other errors
+void log_chunk_flush(LogChunk* lc);
+
 /* Engine Context */
 FollowerContext* follower_init(void);
 void follower_destroy(FollowerContext* ctx);
@@ -65,6 +84,7 @@ void follower_destroy(FollowerContext* ctx);
 /* Target Registration */
 int follower_add_target(FollowerContext* ctx, const char* file_path);
 
-void drain_file(Trackedfile* file); // reads log lines and prints on the terminal for now
+void json_escape_string(const char* src, char* dest, size_t max_len);
+void drain_file(FollowerContext* ctx, Trackedfile* file); // reads log lines and prints on the terminal for now
 
 #endif
