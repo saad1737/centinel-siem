@@ -143,7 +143,6 @@ int main(void) {
     FollowerContext* ctx = follower_init();
     if (!ctx) {
         fprintf(stderr, "Follower Context creation failed\n");
-        exit(EXIT_FAILURE);
     }
 
     // add files to monitor one by one (testing)
@@ -152,163 +151,188 @@ int main(void) {
 
     // declare an event buffer
     char event_buf[EVENT_BUF_LEN] __attribute__((aligned(__alignof__(struct inotify_event)))); // aligning packing is critical
-    ssize_t num_read; // number of bytes read
+    struct epoll_event events[MAX_EPOLL_EVENTS];
     while (keep_running) {
-        num_read = read(ctx->inotify_fd, event_buf, sizeof(event_buf)); // read the event
-        if (num_read < 0) { // handle exit signal or error
-            if (errno == EINTR) continue; // signal exit (SIGINT and SIGTERM)
-            else {
-                perror("event read failed");
-                exit(EXIT_FAILURE);
-            }
+        int nfds = epoll_wait(ctx->epoll_fd, events, MAX_EPOLL_EVENTS, -1);
+        if (nfds < 0) {
+            if (errno == EINTR) continue; // Signal received (Ctrl+C), loop checks keep_running
+            perror("epoll_wait failed");
+            break;
         }
 
-        // handle all events collected by the read call
-        for (char* ptr = event_buf; ptr < event_buf + num_read; ) {
-            struct inotify_event* event = (struct inotify_event*)ptr;
+        // dispatch all ready descriptors
+        for (int i = 0; i < nfds; i++) {
 
-            char file_key[256];
-            snprintf(file_key, sizeof(file_key), "wd:%d", event->wd);
+            // Case 1: Periodic Timer Fired (every 500ms)
+            if (events[i].data.fd == ctx->timer_fd) {
+                // Drain the timer tick (reading 8-byte uint64_t acknowledges the timer to the kernel)
+                uint64_t expirations;
+                ssize_t s = read(ctx->timer_fd, &expirations, sizeof(expirations));
+                (void)s;
 
-            char dir_key[256];
-            snprintf(dir_key, sizeof(dir_key), "dir:%d", event->wd);
-
-            // Check if this is a File Event
-            Trackedfile* file = (Trackedfile*)hashmap_get(ctx->files_by_wd, file_key);
-            if (file) {
-                if (event->mask & IN_MODIFY) {
-                    struct stat st;
-                    if (fstat(file->fd, &st) == 0) {
-                        if (st.st_size < file->offset) {
-                            file->offset = 0;
-                            lseek(file->fd, 0, SEEK_SET);
-                            checkpoint_save(ctx->checkpoint_fd, file->dev, file->inode, 0);
-                        }
-                    }
-                    else {
-                        perror("fstat failed during truncation check");
-                    }
-                    drain_file(ctx, file);
-                }
-                else if (event->mask & (IN_DELETE_SELF | IN_MOVE_SELF)) {
-                    // File moved or unlinked
-                    drain_file(ctx, file);
-                    inotify_rm_watch(ctx->inotify_fd, file->file_wd);
-                    hashmap_remove(ctx->files_by_wd, file_key);
-                    file->file_wd = -1;
-                    close(file->fd);
-                    file->fd = -1;
-                    file->is_active = false;
+                // Periodic Flush: Flush any buffered logs so they don't sit in memory
+                if (ctx->active_chunk && ctx->active_chunk->length > 0) {
+                    log_chunk_flush(ctx->active_chunk);
                 }
             }
-            // Check if this is a Directory Event
-            else {
-                TrackedDir* dir = (TrackedDir*)hashmap_get(ctx->dirs_by_wd, dir_key);
-                if (dir && event->len > 0) {
-                    // Construct full path of what changed:
-                    char full_path[MAX_PATH_LEN * 2];
-                    snprintf(full_path, sizeof(full_path), "%s/%s", dir->dir_path, event->name);
 
-                    // Is this a file we are tracking?
-                    Trackedfile* target_file = (Trackedfile*)hashmap_get(ctx->files_by_path, full_path);
-                    if (target_file) {
-                        if (event->mask & (IN_CREATE | IN_MOVED_TO)) {
-                            // File appeared! Open it, attach file_wd, register in files_by_wd, drain!
-                            char key[32];
-                            snprintf(key, sizeof(key), "wd:%d", target_file->file_wd);
-                            hashmap_remove(ctx->files_by_wd, key);
+            // Case 2: Inotify File Events Fired
+            else if (events[i].data.fd == ctx->inotify_fd) {
+                ssize_t num_read = read(ctx->inotify_fd, event_buf, sizeof(event_buf));
+                if (num_read < 0) {
+                    if (errno == EINTR) continue;
+                    perror("inotify read failed");
+                    break;
+                }
 
-                            if (target_file->file_wd >= 0) { // clear and reset file watch if exists
-                                inotify_rm_watch(ctx->inotify_fd, target_file->file_wd);
-                                target_file->file_wd = -1;
-                            }
+                // Process inotify event stream (Branch A & Branch B, exactly as you have it now!)
+                for (char* ptr = event_buf; ptr < event_buf + num_read; ) {
+                    struct inotify_event* event = (struct inotify_event*)ptr;
 
-                            if (target_file->fd >= 0) { // clear and reset file descriptor if exists
-                                close(target_file->fd);
-                                target_file->fd = -1;
-                            }
+                    char file_key[256];
+                    snprintf(file_key, sizeof(file_key), "wd:%d", event->wd);
 
-                            // try to open the file
+                    char dir_key[256];
+                    snprintf(dir_key, sizeof(dir_key), "dir:%d", event->wd);
+
+                    // Check if this is a File Event
+                    Trackedfile* file = (Trackedfile*)hashmap_get(ctx->files_by_wd, file_key);
+                    if (file) {
+                        if (event->mask & IN_MODIFY) {
                             struct stat st;
-                            int err;
-                            target_file->fd = open(target_file->file_path, O_RDONLY | O_CLOEXEC);
-                            if (target_file->fd < 0) { // open call failure
-                                if (errno == ENOENT) {
-                                    target_file->fd = -1;
-                                    target_file->file_wd = -1;
+                            if (fstat(file->fd, &st) == 0) {
+                                if (st.st_size < file->offset) {
+                                    file->offset = 0;
+                                    lseek(file->fd, 0, SEEK_SET);
+                                    checkpoint_save(ctx->checkpoint_fd, file->dev, file->inode, 0);
+                                }
+                            }
+                            else {
+                                perror("fstat failed during truncation check");
+                            }
+                            drain_file(ctx, file);
+                        }
+                        else if (event->mask & (IN_DELETE_SELF | IN_MOVE_SELF)) {
+                            // File moved or unlinked
+                            drain_file(ctx, file);
+                            inotify_rm_watch(ctx->inotify_fd, file->file_wd);
+                            hashmap_remove(ctx->files_by_wd, file_key);
+                            file->file_wd = -1;
+                            close(file->fd);
+                            file->fd = -1;
+                            file->is_active = false;
+                        }
+                    }
+                    // Check if this is a Directory Event
+                    else {
+                        TrackedDir* dir = (TrackedDir*)hashmap_get(ctx->dirs_by_wd, dir_key);
+                        if (dir && event->len > 0) {
+                            // Construct full path of what changed:
+                            char full_path[MAX_PATH_LEN * 2];
+                            snprintf(full_path, sizeof(full_path), "%s/%s", dir->dir_path, event->name);
+
+                            // Is this a file we are tracking?
+                            Trackedfile* target_file = (Trackedfile*)hashmap_get(ctx->files_by_path, full_path);
+                            if (target_file) {
+                                if (event->mask & (IN_CREATE | IN_MOVED_TO)) {
+                                    // File appeared! Open it, attach file_wd, register in files_by_wd, drain!
+                                    char key[32];
+                                    snprintf(key, sizeof(key), "wd:%d", target_file->file_wd);
+                                    hashmap_remove(ctx->files_by_wd, key);
+
+                                    if (target_file->file_wd >= 0) { // clear and reset file watch if exists
+                                        inotify_rm_watch(ctx->inotify_fd, target_file->file_wd);
+                                        target_file->file_wd = -1;
+                                    }
+
+                                    if (target_file->fd >= 0) { // clear and reset file descriptor if exists
+                                        close(target_file->fd);
+                                        target_file->fd = -1;
+                                    }
+
+                                    // try to open the file
+                                    struct stat st;
+                                    int err;
+                                    target_file->fd = open(target_file->file_path, O_RDONLY | O_CLOEXEC);
+                                    if (target_file->fd < 0) { // open call failure
+                                        if (errno == ENOENT) {
+                                            target_file->fd = -1;
+                                            target_file->file_wd = -1;
+                                            target_file->is_active = false;
+                                        }
+                                        else {
+                                            perror("file open failed");
+                                            exit(EXIT_FAILURE);
+                                        }
+                                    }
+
+                                    if (target_file->fd >= 0) { // open call success
+                                        err = fstat(target_file->fd, &st); // read metadata about the file
+                                        if (err < 0) {
+                                            perror("fstat failed");
+                                            tracked_file_destroy(target_file); // dont destroy dir
+                                            exit(EXIT_FAILURE);
+                                        }
+
+                                        // set inode, dev, offset
+                                        target_file->inode = st.st_ino;
+                                        target_file->offset = 0;
+                                        target_file->dev = st.st_dev;
+                                        target_file->is_active = true;
+
+                                        // seek to start (file created new)
+                                        lseek(target_file->fd, 0, SEEK_SET);
+
+                                        // save to db
+                                        checkpoint_save(ctx->checkpoint_fd, target_file->dev, target_file->inode, 0);
+
+                                        // add file watch
+                                        target_file->file_wd = inotify_add_watch(ctx->inotify_fd, target_file->file_path, IN_MODIFY | IN_ATTRIB);
+                                        if (target_file->file_wd < 0) { // handle error
+                                            perror("File watch failed");
+                                            tracked_file_destroy(target_file); // dont destroy dir
+                                            exit(EXIT_FAILURE);
+                                        }
+
+                                        // register the file wd
+                                        char key[32];
+                                        snprintf(key, sizeof(key), "wd:%d", target_file->file_wd);
+                                        err = hashmap_set(ctx->files_by_wd, key, (void*)target_file);
+                                        if (err == -1) {
+                                            fprintf(stderr, "Hashmap set failed for file %s\n", target_file->file_path);
+                                            tracked_file_destroy(target_file); // dont destroy dir
+                                            exit(EXIT_FAILURE);
+                                        }
+
+                                        // drain initial lines in the buffer
+                                        drain_file(ctx, target_file);
+                                    }
+                                }
+                                else if (event->mask & (IN_DELETE | IN_MOVED_FROM)) {
+                                    // Target was deleted from dir! Clean up watch and fd.
+                                    char key[32];
+                                    snprintf(key, sizeof(key), "wd:%d", target_file->file_wd);
+                                    hashmap_remove(ctx->files_by_wd, key);
+
+                                    if (target_file->file_wd >= 0) { // clear and reset file watch if exists
+                                        inotify_rm_watch(ctx->inotify_fd, target_file->file_wd);
+                                        target_file->file_wd = -1;
+                                    }
+
+                                    if (target_file->fd >= 0) { // clear and reset file descriptor if exists
+                                        close(target_file->fd);
+                                        target_file->fd = -1;
+                                    }
+
                                     target_file->is_active = false;
                                 }
-                                else {
-                                    perror("file open failed");
-                                    exit(EXIT_FAILURE);
-                                }
                             }
-
-                            if (target_file->fd >= 0) { // open call success
-                                err = fstat(target_file->fd, &st); // read metadata about the file
-                                if (err < 0) {
-                                    perror("fstat failed");
-                                    tracked_file_destroy(target_file); // dont destroy dir
-                                    exit(EXIT_FAILURE);
-                                }
-
-                                // set inode, dev, offset
-                                target_file->inode = st.st_ino;
-                                target_file->offset = 0;
-                                target_file->dev = st.st_dev;
-                                target_file->is_active = true;
-
-                                // seek to start (file created new)
-                                lseek(target_file->fd, 0, SEEK_SET);
-
-                                // save to db
-                                checkpoint_save(ctx->checkpoint_fd, target_file->dev, target_file->inode, 0);
-
-                                // add file watch
-                                target_file->file_wd = inotify_add_watch(ctx->inotify_fd, target_file->file_path, IN_MODIFY | IN_ATTRIB);
-                                if (target_file->file_wd < 0) { // handle error
-                                    perror("File watch failed");
-                                    tracked_file_destroy(target_file); // dont destroy dir
-                                    exit(EXIT_FAILURE);
-                                }
-
-                                // register the file wd
-                                char key[32];
-                                snprintf(key, sizeof(key), "wd:%d", target_file->file_wd);
-                                err = hashmap_set(ctx->files_by_wd, key, (void*)target_file);
-                                if (err == -1) {
-                                    fprintf(stderr, "Hashmap set failed for file %s\n", target_file->file_path);
-                                    tracked_file_destroy(target_file); // dont destroy dir
-                                    exit(EXIT_FAILURE);
-                                }
-
-                                // drain initial lines in the buffer
-                                drain_file(ctx, target_file);
-                            }
-                        }
-                        else if (event->mask & (IN_DELETE | IN_MOVED_FROM)) {
-                            // Target was deleted from dir! Clean up watch and fd.
-                            char key[32];
-                            snprintf(key, sizeof(key), "wd:%d", target_file->file_wd);
-                            hashmap_remove(ctx->files_by_wd, key);
-
-                            if (target_file->file_wd >= 0) { // clear and reset file watch if exists
-                                inotify_rm_watch(ctx->inotify_fd, target_file->file_wd);
-                                target_file->file_wd = -1;
-                            }
-
-                            if (target_file->fd >= 0) { // clear and reset file descriptor if exists
-                                close(target_file->fd);
-                                target_file->fd = -1;
-                            }
-
-                            target_file->is_active = false;
                         }
                     }
+
+                    ptr += sizeof(struct inotify_event) + event->len;
                 }
             }
-
-            ptr += sizeof(struct inotify_event) + event->len;
         }
         if (ctx->active_chunk && ctx->active_chunk->length > 0) {
             log_chunk_flush(ctx->active_chunk);

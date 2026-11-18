@@ -1,5 +1,10 @@
 #include "checkpoint.h"
 #include "log_follower.h"
+#include <bits/time.h>
+#include <bits/types/struct_itimerspec.h>
+#include <stdlib.h>
+#include <sys/epoll.h>
+#include <sys/timerfd.h>
 
 Trackedfile* tracked_file_create(const char* full_path) {
     // validate path length
@@ -168,38 +173,68 @@ FollowerContext* follower_init(void) {
     ctx->inotify_fd = inotify_init1(IN_CLOEXEC);
     if (ctx->inotify_fd < 0) {
         perror("inotify_init1 failed");
-        free(ctx);
-        return NULL;
+        exit(EXIT_FAILURE);
     }
 
     ctx->checkpoint_fd = checkpoint_open(CHECKPOINT_DB_PATH);
     if (ctx->checkpoint_fd < 0) {
-        close(ctx->inotify_fd); free(ctx); return NULL;
+        exit(EXIT_FAILURE);
+    }
+
+    ctx->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+    if (ctx->epoll_fd < 0) {
+        perror("epoll_create1 failed");
+        exit(EXIT_FAILURE);
+    }
+
+    // tell epoll to watch inotify_fd
+    struct epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.fd = ctx->inotify_fd;
+    if (epoll_ctl(ctx->epoll_fd, EPOLL_CTL_ADD, ctx->inotify_fd, &ev) < 0) {
+        perror("epoll ctl for inotify fd failed");
+        exit(EXIT_FAILURE);
+    }
+
+    ctx->timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (ctx->timer_fd < 0) {
+        perror("timerfd_create failed");
+        exit(EXIT_FAILURE);
+    }
+
+    // arming the timer (500 ms ticks)
+    struct itimerspec ts;
+    ts.it_interval.tv_sec = 0;
+    ts.it_interval.tv_nsec = FLUSH_INTERVAL_MS * 1000 * 1000;
+    ts.it_value.tv_sec = 0;
+    ts.it_value.tv_nsec = FLUSH_INTERVAL_MS * 1000 * 1000;
+
+    if (timerfd_settime(ctx->timer_fd, 0, &ts, NULL) < 0) {
+        perror("timerfd_settime for timer_fd failed");
+        exit(EXIT_FAILURE);
+    }
+
+    // register timer_fd with epoll
+    ev.events = EPOLLIN;
+    ev.data.fd = ctx->timer_fd;
+    if (epoll_ctl(ctx->epoll_fd, EPOLL_CTL_ADD, ctx->timer_fd, &ev) < 0) {
+        perror("epoll_ctl timer failed");
     }
 
     ctx->files_by_wd = hashmap_init(STARTING_CAPACITY);
-    if (!ctx->files_by_wd) { checkpoint_close(ctx->checkpoint_fd); close(ctx->inotify_fd); free(ctx); return NULL; }
+    if (!ctx->files_by_wd) exit(EXIT_FAILURE);
 
     ctx->files_by_path = hashmap_init(STARTING_CAPACITY);
-    if (!ctx->files_by_path) { free(ctx->files_by_wd); checkpoint_close(ctx->checkpoint_fd); close(ctx->inotify_fd); free(ctx); return NULL; }
+    if (!ctx->files_by_path) exit(EXIT_FAILURE);
 
     ctx->dirs_by_wd = hashmap_init(STARTING_CAPACITY);
-    if (!ctx->dirs_by_wd) { free(ctx->files_by_path); free(ctx->files_by_wd); checkpoint_close(ctx->checkpoint_fd); close(ctx->inotify_fd); free(ctx); return NULL; }
+    if (!ctx->dirs_by_wd) exit(EXIT_FAILURE);
 
     ctx->dirs_by_path = hashmap_init(STARTING_CAPACITY);
-    if (!ctx->dirs_by_path) { free(ctx->dirs_by_wd); free(ctx->files_by_path); free(ctx->files_by_wd); checkpoint_close(ctx->checkpoint_fd); close(ctx->inotify_fd); free(ctx); return NULL; };
+    if (!ctx->dirs_by_path) exit(EXIT_FAILURE);
 
     ctx->active_chunk = log_chunk_create(CHUNK_CAPACITY);
-    if (!ctx->active_chunk) {
-        free(ctx->dirs_by_path);
-        free(ctx->dirs_by_wd);
-        free(ctx->files_by_path);
-        free(ctx->files_by_wd);
-        checkpoint_close(ctx->checkpoint_fd);
-        close(ctx->inotify_fd);
-        free(ctx);
-        return NULL;
-    }
+    if (!ctx->active_chunk) exit(EXIT_FAILURE);
 
     return ctx;
 }
@@ -247,6 +282,19 @@ void follower_destroy(FollowerContext* ctx) {
         checkpoint_close(ctx->checkpoint_fd);
         ctx->checkpoint_fd = -1; // reset
     }
+
+    // close the timer_fd
+    if (ctx->timer_fd >= 0) {
+        close(ctx->timer_fd);
+        ctx->timer_fd = -1; // reset
+    }
+
+    // close the master epoll instance
+    if (ctx->epoll_fd >= 0) {
+        close(ctx->epoll_fd);
+        ctx->epoll_fd = -1; //reset
+    }
+
     free(ctx);
 }
 
