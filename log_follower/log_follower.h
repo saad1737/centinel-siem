@@ -17,6 +17,7 @@
 #include <time.h>
 
 #include "hashmap.h"
+#include "checkpoint.h"
 
 /* Buffer large enough for at least several inotify events */
 #define EVENT_BUF_LEN (256 * (sizeof(struct inotify_event) + NAME_MAX + 1))
@@ -25,6 +26,7 @@
 #define MAX_BUF_LEN 2048
 #define MAX_CHUNK_LEN 8192
 #define CHUNK_CAPACITY (16 * 1024) // 16 KB chunk threshold
+#define CHECKPOINT_DB_PATH "/tmp/sentinel_checkpoint.db"
 
 typedef struct {
     char dir_path[MAX_PATH_LEN]; // path to the directory where the file resides
@@ -56,6 +58,7 @@ typedef struct {
 
 typedef struct {
     int inotify_fd; // the master inotify instance
+    int checkpoint_fd; // file descriptor to sentinel_checkpoint.db
     LogChunk* active_chunk; // to process the log chunk arrived by the read call
     HashMap* files_by_wd; // Maps "wd:<int>" → Trackedfile* -> immediately grab the file upon IN_MODIFY
     HashMap* files_by_path; // Maps full path "/var/log/auth.log" → Trackedfile* -> used for dir events telling a file appeared or disappeared

@@ -109,6 +109,11 @@ void drain_file(FollowerContext* ctx, Trackedfile* file) {
         // Update file offset with consumed bytes
         file->offset += start;
 
+        // save the new offset to disk
+        if (start > 0) {
+            checkpoint_save(ctx->checkpoint_fd, file->dev, file->inode, file->offset);
+        }
+
         // Slide leftover partial line to the front of file->buffer
         size_t leftover = total_bytes - start;
         if (leftover > 0) {
@@ -177,6 +182,7 @@ int main(void) {
                         if (st.st_size < file->offset) {
                             file->offset = 0;
                             lseek(file->fd, 0, SEEK_SET);
+                            checkpoint_save(ctx->checkpoint_fd, file->dev, file->inode, 0);
                         }
                     }
                     else {
@@ -254,6 +260,9 @@ int main(void) {
 
                                 // seek to start (file created new)
                                 lseek(target_file->fd, 0, SEEK_SET);
+
+                                // save to db
+                                checkpoint_save(ctx->checkpoint_fd, target_file->dev, target_file->inode, 0);
 
                                 // add file watch
                                 target_file->file_wd = inotify_add_watch(ctx->inotify_fd, target_file->file_path, IN_MODIFY | IN_ATTRIB);

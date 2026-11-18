@@ -1,3 +1,4 @@
+#include "checkpoint.h"
 #include "log_follower.h"
 
 Trackedfile* tracked_file_create(const char* full_path) {
@@ -171,17 +172,22 @@ FollowerContext* follower_init(void) {
         return NULL;
     }
 
+    ctx->checkpoint_fd = checkpoint_open(CHECKPOINT_DB_PATH);
+    if (ctx->checkpoint_fd < 0) {
+        close(ctx->inotify_fd); free(ctx); return NULL;
+    }
+
     ctx->files_by_wd = hashmap_init(STARTING_CAPACITY);
-    if (!ctx->files_by_wd) { close(ctx->inotify_fd); free(ctx); return NULL; }
+    if (!ctx->files_by_wd) { checkpoint_close(ctx->checkpoint_fd); close(ctx->inotify_fd); free(ctx); return NULL; }
 
     ctx->files_by_path = hashmap_init(STARTING_CAPACITY);
-    if (!ctx->files_by_path) { free(ctx->files_by_wd); close(ctx->inotify_fd); free(ctx); return NULL; }
+    if (!ctx->files_by_path) { free(ctx->files_by_wd); checkpoint_close(ctx->checkpoint_fd); close(ctx->inotify_fd); free(ctx); return NULL; }
 
     ctx->dirs_by_wd = hashmap_init(STARTING_CAPACITY);
-    if (!ctx->dirs_by_wd) { free(ctx->files_by_path); free(ctx->files_by_wd); close(ctx->inotify_fd); free(ctx); return NULL; }
+    if (!ctx->dirs_by_wd) { free(ctx->files_by_path); free(ctx->files_by_wd); checkpoint_close(ctx->checkpoint_fd); close(ctx->inotify_fd); free(ctx); return NULL; }
 
     ctx->dirs_by_path = hashmap_init(STARTING_CAPACITY);
-    if (!ctx->dirs_by_path) { free(ctx->dirs_by_wd); free(ctx->files_by_path); free(ctx->files_by_wd); close(ctx->inotify_fd); free(ctx); return NULL; };
+    if (!ctx->dirs_by_path) { free(ctx->dirs_by_wd); free(ctx->files_by_path); free(ctx->files_by_wd); checkpoint_close(ctx->checkpoint_fd); close(ctx->inotify_fd); free(ctx); return NULL; };
 
     ctx->active_chunk = log_chunk_create(CHUNK_CAPACITY);
     if (!ctx->active_chunk) {
@@ -189,6 +195,7 @@ FollowerContext* follower_init(void) {
         free(ctx->dirs_by_wd);
         free(ctx->files_by_path);
         free(ctx->files_by_wd);
+        checkpoint_close(ctx->checkpoint_fd);
         close(ctx->inotify_fd);
         free(ctx);
         return NULL;
@@ -234,6 +241,12 @@ void follower_destroy(FollowerContext* ctx) {
 
     // close the master inotify descriptor
     close(ctx->inotify_fd);
+
+    // close the database file
+    if (ctx->checkpoint_fd >= 0) {
+        checkpoint_close(ctx->checkpoint_fd);
+        ctx->checkpoint_fd = -1; // reset
+    }
     free(ctx);
 }
 
@@ -312,14 +325,36 @@ int follower_add_target(FollowerContext* ctx, const char* file_path) {
             return -1;
         }
 
-        // set inode, dev, offset
+        // set inode, dev, is_active
         file->inode = st.st_ino;
-        file->offset = st.st_size;
         file->dev = st.st_dev;
         file->is_active = true;
 
-        // seek to end
-        lseek(file->fd, 0, SEEK_END);
+        // query the checkpoint database first to see if the file was monitored before
+        off_t saved_offset = 0;
+        int found = checkpoint_find(ctx->checkpoint_fd, file->dev, file->inode, &saved_offset);
+
+        if (found == 0) { // the file was tracked before
+            // truncation check
+            if (saved_offset <= st.st_size) {
+                // resume from offset
+                file->offset = saved_offset;
+                lseek(file->fd, saved_offset, SEEK_SET);
+            }
+            else { // file was truncated while agent was offline
+                // rewind to start
+                file->offset = 0;
+                lseek(file->fd, 0, SEEK_SET);
+                checkpoint_save(ctx->checkpoint_fd, file->dev, file->inode, 0); // save to database
+            }
+        }
+        else { // the file was not tracked before
+            // start in tail mode
+            file->offset = st.st_size;
+            // seek to end
+            lseek(file->fd, 0, SEEK_END);
+            checkpoint_save(ctx->checkpoint_fd, file->dev, file->inode, file->offset); // save to database
+        }
 
         // add file watch
         file->file_wd = inotify_add_watch(ctx->inotify_fd, file->file_path, IN_MODIFY | IN_ATTRIB);
@@ -337,6 +372,12 @@ int follower_add_target(FollowerContext* ctx, const char* file_path) {
             fprintf(stderr, "Hashmap set failed for file %s\n", file->file_path);
             tracked_file_destroy(file); // dont destroy dir
             return -1;
+        }
+
+        // catch-up ingestion
+        if (found == 0 && file->offset < st.st_size) { // new logs were written to the file while the follower was offline
+            // drain the logs
+            drain_file(ctx, file);
         }
     }
 
