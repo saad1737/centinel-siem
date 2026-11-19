@@ -1,4 +1,5 @@
 #include "checkpoint.h"
+#include "chunk_queue.h"
 #include "log_follower.h"
 #include <bits/time.h>
 #include <bits/types/struct_itimerspec.h>
@@ -236,10 +237,29 @@ FollowerContext* follower_init(void) {
     ctx->active_chunk = log_chunk_create(CHUNK_CAPACITY);
     if (!ctx->active_chunk) exit(EXIT_FAILURE);
 
+    // initialize the queue
+    chunk_queue_init(&ctx->queue);
+
+    ctx->is_paused = false; // default
+
     return ctx;
 }
 
 void follower_destroy(FollowerContext* ctx) {
+    if (!ctx) return;
+
+    ctx->is_paused = false; // Disarm catch-up triggers during teardown
+    // free the chunk
+    if (ctx->active_chunk) {
+        if (ctx->active_chunk->length > 0)
+            follower_seal_active_chunk(ctx); // Seal any pending logs before exiting
+        log_chunk_destroy(ctx->active_chunk);
+        ctx->active_chunk = NULL;
+    }
+
+    follower_drain_queue(ctx, 0); // Drain all remaining chunks
+    chunk_queue_destroy(&ctx->queue);
+
     // Clean up all tracked files
     for (size_t i = 0; i < ctx->files_by_path->capacity; i++) {
         HashNode* node = ctx->files_by_path->nodeList[i];
@@ -267,12 +287,6 @@ void follower_destroy(FollowerContext* ctx) {
     hashmap_free(ctx->files_by_path);
     hashmap_free(ctx->dirs_by_wd);
     hashmap_free(ctx->dirs_by_path);
-
-    // free the chunk
-    if (ctx->active_chunk) {
-        log_chunk_flush(ctx->active_chunk); // Flush any pending logs before exiting
-        log_chunk_destroy(ctx->active_chunk);
-    }
 
     // close the master inotify descriptor
     close(ctx->inotify_fd);
@@ -430,4 +444,79 @@ int follower_add_target(FollowerContext* ctx, const char* file_path) {
     }
 
     return 0;
+}
+
+void follower_seal_active_chunk(FollowerContext* ctx) {
+    if (!ctx || !ctx->active_chunk || ctx->active_chunk->length == 0) return; // invalid arguments
+
+    // push chunk to the queue
+    int err = chunk_queue_push(&ctx->queue, ctx->active_chunk);
+    if (err == -1) {
+        fprintf(stderr, "Chunk queue is full\n");
+        ctx->is_paused = true; // pause reading
+        return;
+    }
+
+    // check for backpressure
+    if (chunk_queue_is_full(&ctx->queue) && !ctx->is_paused) {
+        ctx->is_paused = true;
+        fprintf(stderr, "Backpressure detected. Pausing disk ingestion\n");
+    }
+
+    // allocate new active chunk and replace
+    ctx->active_chunk = log_chunk_create(CHUNK_CAPACITY);
+}
+
+void follower_catchup_all(FollowerContext* ctx) {
+    if (!ctx || !ctx->files_by_path) return; // invalid arguments
+
+    // iterate through the files
+    for (size_t i = 0; i < ctx->files_by_path->capacity; i++) {
+        if (ctx->is_paused) break; // if catching up causes backpressure again, pause!!!
+
+        HashNode* node = ctx->files_by_path->nodeList[i];
+        while (node) {
+            Trackedfile* f = (Trackedfile*)node->value;
+
+            struct stat st;
+            if (f && f->fd >= 0) {
+                fstat(f->fd, &st);
+                if (f->offset < st.st_size) {
+                    drain_file(ctx, f);
+                }
+            }
+
+            node = node->next;
+        }
+    }
+}
+
+size_t follower_drain_queue(FollowerContext* ctx, size_t max_chunks) {
+    if (!ctx || ctx->queue.count == 0) return 0;
+
+    // drain the queue
+    size_t drained = 0;
+    while (ctx->queue.count && (max_chunks == 0 || drained < max_chunks)) {
+        LogChunk* chunk = chunk_queue_pop(&ctx->queue);
+        if (!chunk) break;
+
+        // simulate transmission (for now)
+        printf("=== [CONSUMER TRANSMIT: %zu records, %zu bytes | Queue remaining: %zu] ===\n", chunk->record_count, chunk->length, ctx->queue.count);
+        fwrite(chunk->data, sizeof(char), chunk->length, stdout);
+        fflush(stdout);
+
+        // destroy transmitted chunk
+        log_chunk_destroy(chunk);
+        drained++;
+    }
+
+    // release backpressure and trigger catch-up
+    if (ctx->is_paused && ctx->queue.count <= QUEUE_LOW_WATERMARK) {
+        ctx->is_paused = false;
+        fprintf(stderr, "[BACKPRESSURE RELEASED] Queue dropped to %zu chunks (<= low watermark %d). Resuming disk ingestion.\n",
+                ctx->queue.count, QUEUE_LOW_WATERMARK);
+        follower_catchup_all(ctx);
+    }
+
+    return drained;
 }

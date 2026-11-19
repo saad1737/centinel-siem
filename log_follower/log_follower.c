@@ -31,6 +31,8 @@ void json_escape_string(const char* src, char* dest, size_t max_len) {
 }
 
 void drain_file(FollowerContext* ctx, Trackedfile* file) {
+    if (!ctx || !file || ctx->is_paused || !ctx->active_chunk) return;
+
     while (1) {
         // Calculate how much space is left in file->buffer
         size_t space_avail = sizeof(file->buffer) - file->buf_len;
@@ -51,7 +53,7 @@ void drain_file(FollowerContext* ctx, Trackedfile* file) {
                                    (long)time(NULL), file->file_name, escaped_msg);
 
             if (log_chunk_append(ctx->active_chunk, record, (size_t)rec_len) == 1) {
-                log_chunk_flush(ctx->active_chunk);
+                follower_seal_active_chunk(ctx);
                 log_chunk_append(ctx->active_chunk, record, (size_t)rec_len);
             }
 
@@ -96,9 +98,9 @@ void drain_file(FollowerContext* ctx, Trackedfile* file) {
                                        "{\"ts\":%ld,\"file\":\"%s\",\"msg\":\"%s\"}\n",
                                        (long)time(NULL), file->file_name, escaped_msg);
 
-                // Append into active chunk (flush if full)
+                // Append into active chunk (seal chunk if full)
                 if (log_chunk_append(ctx->active_chunk, record, (size_t)rec_len) == 1) {
-                    log_chunk_flush(ctx->active_chunk);
+                    follower_seal_active_chunk(ctx);
                     log_chunk_append(ctx->active_chunk, record, (size_t)rec_len);
                 }
 
@@ -123,6 +125,9 @@ void drain_file(FollowerContext* ctx, Trackedfile* file) {
         else {
             file->buf_len = 0;
         }
+
+        // Check for backpressure
+        if (ctx->is_paused) break;
 
         // If we read less than the buffer capacity and consumed nothing new, we've hit EOF
         if (bytes_read < (ssize_t)space_avail && start == 0) {
@@ -170,10 +175,12 @@ int main(void) {
                 ssize_t s = read(ctx->timer_fd, &expirations, sizeof(expirations));
                 (void)s;
 
-                // Periodic Flush: Flush any buffered logs so they don't sit in memory
+                // Periodic Seal: Seal any buffered logs so they don't sit in memory
                 if (ctx->active_chunk && ctx->active_chunk->length > 0) {
-                    log_chunk_flush(ctx->active_chunk);
+                    follower_seal_active_chunk(ctx);
                 }
+                // call follower drain
+                follower_drain_queue(ctx, 4); // drain upto 4 chunks per 500ms tick
             }
 
             // Case 2: Inotify File Events Fired
@@ -333,9 +340,6 @@ int main(void) {
                     ptr += sizeof(struct inotify_event) + event->len;
                 }
             }
-        }
-        if (ctx->active_chunk && ctx->active_chunk->length > 0) {
-            log_chunk_flush(ctx->active_chunk);
         }
     }
 

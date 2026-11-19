@@ -20,6 +20,7 @@
 
 #include "hashmap.h"
 #include "checkpoint.h"
+#include "chunk_queue.h"
 
 /* Buffer large enough for at least several inotify events */
 #define EVENT_BUF_LEN (256 * (sizeof(struct inotify_event) + NAME_MAX + 1))
@@ -52,7 +53,7 @@ typedef struct {
     int ref_count; // number of files being monitored in this directory
 } TrackedDir;
 
-typedef struct {
+typedef struct LogChunk {
     char* data; // Pre-allocated contiguous byte buffer
     size_t capacity; // Maximum size (e.g. 16384 bytes)
     size_t length; // Current number of bytes written
@@ -70,6 +71,8 @@ typedef struct {
     HashMap* files_by_path; // Maps full path "/var/log/auth.log" → Trackedfile* -> used for dir events telling a file appeared or disappeared
     HashMap* dirs_by_wd; //  Maps "dir:<int>" → TrackedDir* -> immediately grab the directory upon a dir event
     HashMap* dirs_by_path; // Maps full path "/var/log" → TrackedDir* -> used when adding a new file target to follow
+    ChunkQueue queue; // in-memory queue of sealed chunks ready to be sent
+    bool is_paused; // disk backpressure state (true = pause file reads)
 } FollowerContext;
 
 /* Lifecycle for Trackedfile */
@@ -93,6 +96,16 @@ void follower_destroy(FollowerContext* ctx);
 /* Target Registration */
 int follower_add_target(FollowerContext* ctx, const char* file_path);
 
+/* Chunk sealing */
+void follower_seal_active_chunk(FollowerContext* ctx);
+
+/* Catch up routine after backpressure releases */
+void follower_catchup_all(FollowerContext* ctx);
+
+/* Consumer Routine */
+size_t follower_drain_queue(FollowerContext* ctx, size_t max_chunks); // max_chunks = 0 -> drain all available chunks
+
+/* Helpers */
 void json_escape_string(const char* src, char* dest, size_t max_len);
 void drain_file(FollowerContext* ctx, Trackedfile* file); // reads log lines and prints on the terminal for now
 
