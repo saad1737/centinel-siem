@@ -22,6 +22,7 @@ typedef enum {
 } GeneratorMode;
 
 typedef struct {
+    // add a target path for a file
     char target_host[TARGET_HOST_LEN]; // Stores address of the CWEB engine
     uint16_t target_port; // Stores CWEB engine server port
     char target_path[TARGET_PATH_LEN]; // Stores '/ws/ingest' endpoint
@@ -33,7 +34,7 @@ typedef struct {
     uint8_t ratio_benign;
     uint8_t ratio_ssh_bf;
     uint8_t ratio_web_attack;
-    uint8_t ratio_sudo_abuse;
+    uint8_t ratio_sudo_abuse; // aro ashte pare
     // attack entity simulation
     uint32_t attacker_ip_pool_size;
     char victim_ip[VICTIM_IP_LEN];

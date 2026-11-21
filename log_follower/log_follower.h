@@ -28,7 +28,7 @@
 #define MAX_NAME_LEN 128
 #define MAX_BUF_LEN 2048
 #define MAX_CHUNK_LEN 8192
-#define CHUNK_CAPACITY (16 * 1024) // 16 KB chunk threshold
+#define CHUNK_CAPACITY (12 * 1024) // 12 KB chunk threshold
 #define CHECKPOINT_DB_PATH "/tmp/sentinel_checkpoint.db"
 #define MAX_EPOLL_EVENTS 16
 #define FLUSH_INTERVAL_MS 500 // timer ticks every 500 ms
