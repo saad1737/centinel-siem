@@ -1,6 +1,7 @@
 #include "checkpoint.h"
 #include "chunk_queue.h"
 #include "log_follower.h"
+#include "ws_client.h"
 #include <bits/time.h>
 #include <bits/types/struct_itimerspec.h>
 #include <stdlib.h>
@@ -242,6 +243,9 @@ FollowerContext* follower_init(void) {
 
     ctx->is_paused = false; // default
 
+    // initialize the ws client
+    ws_client_init(&ctx->ws, "127.0.0.1", 8765, "/ws/ingest");
+    ws_client_connect(&ctx->ws, ctx->epoll_fd); // Don't exit on failure! ws_client_tick will retry.
     return ctx;
 }
 
@@ -302,6 +306,9 @@ void follower_destroy(FollowerContext* ctx) {
         close(ctx->timer_fd);
         ctx->timer_fd = -1; // reset
     }
+
+    // destroy the ws client
+    ws_client_destroy(&ctx->ws, ctx->epoll_fd);
 
     // close the master epoll instance
     if (ctx->epoll_fd >= 0) {
@@ -494,6 +501,8 @@ void follower_catchup_all(FollowerContext* ctx) {
 size_t follower_drain_queue(FollowerContext* ctx, size_t max_chunks) {
     if (!ctx || ctx->queue.count == 0) return 0;
 
+    if (ctx->ws.state != WS_STATE_CONNECTED) return 0; // do not drain while client is not connected to the server
+
     // drain the queue
     size_t drained = 0;
     while (ctx->queue.count && (max_chunks == 0 || drained < max_chunks)) {
@@ -501,9 +510,17 @@ size_t follower_drain_queue(FollowerContext* ctx, size_t max_chunks) {
         if (!chunk) break;
 
         // simulate transmission (for now)
-        printf("=== [CONSUMER TRANSMIT: %zu records, %zu bytes | Queue remaining: %zu] ===\n", chunk->record_count, chunk->length, ctx->queue.count);
-        fwrite(chunk->data, sizeof(char), chunk->length, stdout);
-        fflush(stdout);
+        // printf("=== [CONSUMER TRANSMIT: %zu records, %zu bytes | Queue remaining: %zu] ===\n", chunk->record_count, chunk->length, ctx->queue.count);
+        // fwrite(chunk->data, sizeof(char), chunk->length, stdout);
+        // fflush(stdout);
+
+        // send the chunk
+        ssize_t sent = ws_client_send_chunk(&ctx->ws, chunk->data, chunk->length, ctx->epoll_fd);
+        if (sent < 0) {
+            // Socket dropped or kernel buffer full; re-enqueue or handle failure
+            chunk_queue_push(&ctx->queue, chunk);
+            return 0; // try again
+        }
 
         // destroy transmitted chunk
         log_chunk_destroy(chunk);

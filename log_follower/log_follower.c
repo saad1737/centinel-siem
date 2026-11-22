@@ -1,4 +1,5 @@
 #include "log_follower.h"
+#include "ws_client.h"
 
 static volatile sig_atomic_t keep_running = 1;
 
@@ -168,12 +169,15 @@ int main(void) {
         // dispatch all ready descriptors
         for (int i = 0; i < nfds; i++) {
 
-            // Case 1: Periodic Timer Fired (every 500ms)
+            // Periodic Timer Fired (every 500ms)
             if (events[i].data.fd == ctx->timer_fd) {
                 // Drain the timer tick (reading 8-byte uint64_t acknowledges the timer to the kernel)
                 uint64_t expirations;
                 ssize_t s = read(ctx->timer_fd, &expirations, sizeof(expirations));
                 (void)s;
+
+                // ws tick
+                ws_client_tick(&ctx->ws, ctx->epoll_fd);
 
                 // Periodic Seal: Seal any buffered logs so they don't sit in memory
                 if (ctx->active_chunk && ctx->active_chunk->length > 0) {
@@ -183,7 +187,12 @@ int main(void) {
                 follower_drain_queue(ctx, 4); // drain upto 4 chunks per 500ms tick
             }
 
-            // Case 2: Inotify File Events Fired
+            // Ws socket eent
+            else if  (events[i].data.fd == ctx->ws.sock_fd) {
+                ws_client_handle_event(&ctx->ws, events[i].events, ctx->epoll_fd);
+            }
+
+            // Inotify File Events Fired
             else if (events[i].data.fd == ctx->inotify_fd) {
                 ssize_t num_read = read(ctx->inotify_fd, event_buf, sizeof(event_buf));
                 if (num_read < 0) {

@@ -21,6 +21,7 @@
 #include "hashmap.h"
 #include "checkpoint.h"
 #include "chunk_queue.h"
+#include "ws_client.h"
 
 /* Buffer large enough for at least several inotify events */
 #define EVENT_BUF_LEN (256 * (sizeof(struct inotify_event) + NAME_MAX + 1))
@@ -73,6 +74,7 @@ typedef struct {
     HashMap* dirs_by_path; // Maps full path "/var/log" → TrackedDir* -> used when adding a new file target to follow
     ChunkQueue queue; // in-memory queue of sealed chunks ready to be sent
     bool is_paused; // disk backpressure state (true = pause file reads)
+    WsClient ws; // websocket client context of the log follower
 } FollowerContext;
 
 /* Lifecycle for Trackedfile */
