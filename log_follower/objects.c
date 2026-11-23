@@ -164,7 +164,7 @@ void log_chunk_flush(LogChunk* lc) {
     lc->created_at = time(NULL);
 }
 
-FollowerContext* follower_init(void) {
+FollowerContext* follower_init(const FollowerConfig* cfg) {
     // allocate memory and handle error
     FollowerContext* ctx = calloc(1, sizeof(FollowerContext));
     if (!ctx) {
@@ -178,7 +178,10 @@ FollowerContext* follower_init(void) {
         exit(EXIT_FAILURE);
     }
 
-    ctx->checkpoint_fd = checkpoint_open(CHECKPOINT_DB_PATH);
+    if (cfg && cfg->checkpoint_db_path)
+        ctx->checkpoint_fd = checkpoint_open(cfg->checkpoint_db_path);
+    else 
+        ctx->checkpoint_fd = checkpoint_open(CHECKPOINT_DB_PATH);
     if (ctx->checkpoint_fd < 0) {
         exit(EXIT_FAILURE);
     }
@@ -244,7 +247,7 @@ FollowerContext* follower_init(void) {
     ctx->is_paused = false; // default
 
     // initialize the ws client
-    ws_client_init(&ctx->ws, "127.0.0.1", 8765, "/ws/ingest");
+    ws_client_init(&ctx->ws, cfg && cfg->server_host ? cfg->server_host : "127.0.0.1", cfg && cfg->server_port > 0 ? cfg->server_port : 8765, cfg && cfg->ws_path ? cfg->ws_path : "/ws/ingest");
     ws_client_connect(&ctx->ws, ctx->epoll_fd); // Don't exit on failure! ws_client_tick will retry.
     return ctx;
 }

@@ -1,5 +1,4 @@
 #include "log_follower.h"
-#include "ws_client.h"
 
 static volatile sig_atomic_t keep_running = 1;
 
@@ -137,7 +136,21 @@ void drain_file(FollowerContext* ctx, Trackedfile* file) {
     }
 }
 
-int main(void) {
+void print_usage(const char *prog_name) {
+    printf("Centinel SIEM Log Follower Daemon\n");
+    printf("Usage: %s [OPTIONS] <target_log_1> [target_log_2 ...]\n\n", prog_name);
+    printf("Options:\n");
+    printf("  -s, --server <host>       SIEM server IP or hostname (default: 127.0.0.1)\n");
+    printf("  -p, --port <port>         SIEM server port (default: 8765)\n");
+    printf("  -u, --path <uri>          WebSocket URI endpoint (default: /ws/ingest)\n");
+    printf("  -c, --checkpoint <path>   Path to checkpoint DB (default: %s)\n", CHECKPOINT_DB_PATH);
+    printf("  -h, --help                Display this manual\n\n");
+    printf("Examples:\n");
+    printf("  %s /var/log/auth.log /var/log/syslog\n", prog_name);
+    printf("  %s -s 10.0.0.1 -p 8765 -u /logs /var/log/*.log\n", prog_name);
+}
+
+int main(int argc, char** argv) {
     // signal/interrupt handler setup
     /* Graceful exit on Ctrl+C */
     struct sigaction sa = {0};
@@ -145,15 +158,73 @@ int main(void) {
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
+    // options for CLI parsing
+    static struct option long_options[] = {
+        {"server", 1, 0, 's'},
+        {"port", 1, 0, 'p'},
+        {"path", 1, 0, 'u'},
+        {"checkpoint", 1, 0, 'c'},
+        {"help", 0, 0, 'h'},
+        {0, 0, 0, 0} // needed for adding target files (no specific flag for them)
+    };
+
+    FollowerConfig config;
+    config.server_host = "127.0.0.1";
+    config.server_port = 8765;
+    config.ws_path = "/ws/ingest";
+    config.checkpoint_db_path = CHECKPOINT_DB_PATH;
+
+    // parse options in a loop
+    int opt;
+    while ((opt = getopt_long(argc, argv, "s:p:u:c:h", long_options, NULL)) != -1) {
+        switch (opt) {
+            case 's':
+                config.server_host = optarg;
+                break;
+            case 'p': {
+                unsigned long p = strtoul(optarg, NULL, 10);
+                if (p == 0 || p > 65535) {
+                    fprintf(stderr, "Error: Invalid port number: %s\n", optarg);
+                    return EXIT_FAILURE;
+                }
+                config.server_port = (int)p;
+                break;
+            }
+            case 'u':
+                config.ws_path = optarg;
+                break;
+            case 'c':
+                config.checkpoint_db_path = optarg;
+                break;
+            case 'h':
+                print_usage(argv[0]);
+                return EXIT_SUCCESS;
+            default:
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+        }
+    }
+
+    // If optind >= argc, the user didn't specify any log files to track!
+    if (optind >= argc) {
+        fprintf(stderr, "Error: No target log files specified.\n\n");
+        print_usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+
     // initialize the follower contex
-    FollowerContext* ctx = follower_init();
+    FollowerContext* ctx = follower_init(&config);
     if (!ctx) {
         fprintf(stderr, "Follower Context creation failed\n");
     }
 
-    // add files to monitor one by one (testing)
-    follower_add_target(ctx, "/tmp/test1.log");
-    follower_add_target(ctx, "/tmp/test2.log");
+    // add the target files
+    for (int i = optind; i < argc; i++) {
+        if (follower_add_target(ctx, argv[i]) == -1) {
+            fprintf(stderr, "Failed to follow %s\n", argv[i]);
+            exit(EXIT_FAILURE); // abort
+        }
+    }
 
     // declare an event buffer
     char event_buf[EVENT_BUF_LEN] __attribute__((aligned(__alignof__(struct inotify_event)))); // aligning packing is critical

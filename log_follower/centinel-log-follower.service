@@ -1,0 +1,33 @@
+[Unit]
+Description=centinel SIEM High-Performance Log Follower
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/centinel-log-follower
+ExecStart=/usr/local/bin/centinel_log_fol -s ${SERVER} -p ${PORT} -u ${WS_PATH} -c ${CHECKPOINT_DB} ${LOG_TARGETS}
+
+# Process Lifecycle & Self-Healing
+Restart=always
+RestartSec=2s
+KillMode=mixed
+TimeoutStopSec=5s
+
+# Resource Hardening (VPS Protection)
+MemoryMax=32M
+MemoryHigh=24M
+CPUWeight=50
+
+# Security Sandboxing
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadOnlyPaths=/var/log
+
+# Automatic State Directory (/var/lib/centinel)
+StateDirectory=centinel
+
+[Install]
+WantedBy=multi-user.target

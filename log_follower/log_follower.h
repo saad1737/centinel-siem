@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <time.h>
+#include <getopt.h>
 
 #include "hashmap.h"
 #include "checkpoint.h"
@@ -30,9 +31,16 @@
 #define MAX_BUF_LEN 2048
 #define MAX_CHUNK_LEN 8192
 #define CHUNK_CAPACITY (12 * 1024) // 12 KB chunk threshold
-#define CHECKPOINT_DB_PATH "/tmp/sentinel_checkpoint.db"
+#define CHECKPOINT_DB_PATH "/tmp/centinel_checkpoint.db"
 #define MAX_EPOLL_EVENTS 16
 #define FLUSH_INTERVAL_MS 500 // timer ticks every 500 ms
+
+typedef struct {
+    const char* server_host; // ip of the server to connect
+    uint16_t server_port; // port of the server to connect
+    const char* ws_path; // endpoint of the server to connect
+    const char* checkpoint_db_path; // path where the checkpoint db file will be saved
+} FollowerConfig;
 
 typedef struct {
     char dir_path[MAX_PATH_LEN]; // path to the directory where the file resides
@@ -92,7 +100,7 @@ int log_chunk_append(LogChunk* lc, const char* record, size_t record_len); // re
 void log_chunk_flush(LogChunk* lc);
 
 /* Engine Context */
-FollowerContext* follower_init(void);
+FollowerContext* follower_init(const FollowerConfig* cfg);
 void follower_destroy(FollowerContext* ctx);
 
 /* Target Registration */
@@ -110,5 +118,6 @@ size_t follower_drain_queue(FollowerContext* ctx, size_t max_chunks); // max_chu
 /* Helpers */
 void json_escape_string(const char* src, char* dest, size_t max_len);
 void drain_file(FollowerContext* ctx, Trackedfile* file); // reads log lines and prints on the terminal for now
+void print_usage(const char* prog_name); // Prints tutorial to use the program
 
 #endif

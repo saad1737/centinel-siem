@@ -100,7 +100,7 @@ int config_parse_cli(GeneratorConfig* cfg, int argc, char** argv) {
                 }
 
                 // safely copy the target host ip in the required config field
-                snprintf(cfg->target_host, sizeof(cfg->target_host), "%s",optarg);
+                snprintf(cfg->target_host, sizeof(cfg->target_host), "%s", optarg);
                 cfg->target_host[size] = '\0'; // explicit null termination
                 break;
             }

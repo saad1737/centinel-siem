@@ -1,0 +1,11 @@
+# Configuration for Centinel SIEM Log Follower
+# Target SIEM WebSocket Endpoint
+SERVER="127.0.0.1"
+PORT="8765"
+WS_PATH="/ws/ingest"
+
+# Persistent binary checkpoint file
+CHECKPOINT_DB="/var/lib/sentinel/centinel_checkpoint.db"
+
+# Space-separated list of log files to monitor (supports wildcards)
+LOG_TARGETS="/var/log/auth.log /var/log/syslog"
