@@ -179,9 +179,19 @@ int main(int argc, char** argv) {
     while ((opt = getopt_long(argc, argv, "s:p:u:c:h", long_options, NULL)) != -1) {
         switch (opt) {
             case 's':
+                if (!optarg || optarg[0] == '\0' || optarg[0] == '-') {
+                    fprintf(stderr, "Error: Invalid value for options\n");
+                    return EXIT_FAILURE;
+                }
+                
                 config.server_host = optarg;
                 break;
             case 'p': {
+                if (!optarg || optarg[0] == '\0' || optarg[0] == '-') {
+                    fprintf(stderr, "Error: Invalid value for options\n");
+                    return EXIT_FAILURE;
+                }
+                
                 unsigned long p = strtoul(optarg, NULL, 10);
                 if (p == 0 || p > 65535) {
                     fprintf(stderr, "Error: Invalid port number: %s\n", optarg);
@@ -191,9 +201,19 @@ int main(int argc, char** argv) {
                 break;
             }
             case 'u':
+                if (!optarg || optarg[0] == '\0' || optarg[0] == '-') {
+                    fprintf(stderr, "Error: Invalid value for options\n");
+                    return EXIT_FAILURE;
+                }
+                
                 config.ws_path = optarg;
                 break;
             case 'c':
+                if (!optarg || optarg[0] == '\0' || optarg[0] == '-') {
+                    fprintf(stderr, "Error: Invalid value for options\n");
+                    return EXIT_FAILURE;
+                }
+                
                 config.checkpoint_db_path = optarg;
                 break;
             case 'h':
