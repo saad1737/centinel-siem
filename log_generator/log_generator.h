@@ -13,7 +13,7 @@
 #define TARGET_PATH_LEN 16
 #define VICTIM_IP_LEN 16
 #define MAX_EPS 500000
-#define MAX_BATCH_SiZE 4096
+#define MAX_BATCH_SIZE 4096
 
 typedef enum {
     MODE_CONTINUOUS, // normal paced log streaming with specifies EPS

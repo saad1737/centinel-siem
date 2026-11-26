@@ -16,12 +16,9 @@ void config_default_init(GeneratorConfig* cfg) {
     cfg->attacker_ip_pool_size = 10;
     cfg->verbosity = true;
 
-    strncpy(cfg->target_host, "127.0.0.1", 9);
-    cfg->target_host[9] = '\0'; // explicit null termination
-    strncpy(cfg->target_path, "/ws/ingest", 10);
-    cfg->target_path[10] = '\0'; // explicit null termination
-    strncpy(cfg->victim_ip, "10.0.0.1", 8);
-    cfg->victim_ip[8] = '\0';
+    snprintf(cfg->target_host, sizeof cfg->target_host, "127.0.0.1");
+    snprintf(cfg->target_path, sizeof cfg->target_path, "/tmp/log-file");
+    snprintf(cfg->victim_ip,   sizeof cfg->victim_ip,   "10.0.0.1");
 }
 
 void config_print_usage(void) {
@@ -315,7 +312,7 @@ int config_validate(const GeneratorConfig* cfg) { // abort the program if this f
     }
 
     // batch size validation
-    if (cfg->batch_size == 0 || cfg->batch_size > MAX_BATCH_SiZE) {
+    if (cfg->batch_size == 0 || cfg->batch_size > MAX_BATCH_SIZE) {
         fprintf(stderr, "Batch size out of allowed range\n");
         return -1;
     }
@@ -347,6 +344,12 @@ int config_validate(const GeneratorConfig* cfg) { // abort the program if this f
         return -1;
     }
 
+    // check attacker_ip_pool_size
+    if (cfg->attacker_ip_pool_size == 0) {
+        fprintf(stderr, "IP pool size must be at least 1\n");
+        return -1;
+    }
+
     // other validity checks if needed
     
 
@@ -359,7 +362,7 @@ void config_dump(const GeneratorConfig* cfg) {
     // Print summary from here...
     // well, if the formatting is bad then it can be improved.
     printf("=============================================================================\n");
-    printf("    Target  : ws://%s:%u%s\n", cfg->target_host, (unsigned)cfg->target_port, cfg->target_path);
+    printf("    Target Path : %s\n", cfg->target_path);
     printf("    Mode    : %s\n", mode_to_str(cfg->mode));
 
     if (cfg->mode == MODE_BENCHMARK) {
