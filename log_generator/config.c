@@ -17,7 +17,7 @@ void config_default_init(GeneratorConfig* cfg) {
     cfg->verbosity = true;
 
     snprintf(cfg->target_host, sizeof cfg->target_host, "127.0.0.1");
-    snprintf(cfg->target_path, sizeof cfg->target_path, "/tmp/log-file");
+    snprintf(cfg->target_path, sizeof cfg->target_path, "/tmp/test.log");
     snprintf(cfg->victim_ip,   sizeof cfg->victim_ip,   "10.0.0.1");
 }
 
