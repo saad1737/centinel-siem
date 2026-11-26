@@ -1,4 +1,25 @@
 #include "log_generator.h"
+#include <errno.h>
+
+static int parse_u32_arg(const char* text, const char* name, uint32_t* value) {
+    char* end = NULL;
+    unsigned long long parsed;
+
+    if (!text || !text[0] || text[0] == '-') {
+        fprintf(stderr, "Invalid %s: %s\n", name, text ? text : "(missing)");
+        return -1;
+    }
+
+    errno = 0;
+    parsed = strtoull(text, &end, 10);
+    if (errno == ERANGE || end == text || *end != '\0' || parsed > UINT32_MAX) {
+        fprintf(stderr, "Invalid %s: %s\n", name, text);
+        return -1;
+    }
+
+    *value = (uint32_t)parsed;
+    return 0;
+}
 
 void config_default_init(GeneratorConfig* cfg) {
     // zero out the struct memory first (full clear)
@@ -9,6 +30,9 @@ void config_default_init(GeneratorConfig* cfg) {
     cfg->mode = MODE_CONTINUOUS;
     cfg->batch_size = 32;
     cfg->duration_sec = 0;
+    cfg->total_logs = 0;
+    cfg->write_sec = 0;
+    cfg->pause_sec = 0;
     cfg->ratio_benign = 70;
     cfg->ratio_ssh_bf = 15;
     cfg->ratio_web_attack = 10;
@@ -22,20 +46,20 @@ void config_default_init(GeneratorConfig* cfg) {
 }
 
 void config_print_usage(void) {
-    // print the full usage tutorial here
-    printf("Centinel Log Generator\n");
-    // code from here
     printf(
-        "Usage: ./centinel_log_gen [OPTIONS]\n"
-        "Connection Options:\n"
-        "  -h, --host <string>       CWEB server host (Default: \"127.0.0.1\")\n"
-        "  -p, --port <int>          CWEB server port (Default: 8080)\n"
-        "  -u, --uri <string>        WebSocket path (Default: \"/ws/ingest\")\n"
+        "Usage: ./centinel_log_gen <logs> <seconds> [OPTIONS]  (normal mode)\n"
+        "       ./centinel_log_gen -n <logs> -w <seconds> -P <pause> [OPTIONS]\n"
+        "Output Options:\n"
+        "  -o, --output <file>       Log file to append to (Default: /tmp/test.log)\n"
+        "  -q, --quiet               Do not echo generated logs to the terminal\n"
         "Load & Execution Options:\n"
         "  -e, --eps <int>           Target events/sec (Default: 1000)\n"
+        "  -n, --count <int>         Number of logs (per window in pause mode)\n"
+        "  -w, --write-time <int>    Write-window duration in seconds\n"
+        "  -P, --pause <int>         Pause after each write window\n"
         "  -m, --mode <string>       \"continuous\", \"burst\", \"bench\"\n"
         "  -b, --batch <int>         Batch flush size (Default: 32)\n"
-        "  -d, --duration <int>      Duration in seconds (0 = infinite)\n"
+        "  -d, --duration <int>      Normal write time; pause-mode total runtime\n"
         "Traffic Mix Options (Percentages):\n"
         "      --benign <int>        Benign traffic %% (Default: 70)\n"
         "      --ssh-bf <int>        SSH brute force %% (Default: 15)\n"
@@ -44,10 +68,9 @@ void config_print_usage(void) {
         "      --ip-pool <int>       Number of attacker IPs (Default: 10)\n"
         "General Options:\n"
         "  -v, --verbose             Enable verbose stdout logging\n"
-        "  -?, --help                Print formatted usage guide & exit\n"
+        "  -?, --help                Print formatted usage guide\n"
+        "Legacy connection options -h/--host, -p/--port, and -u/--uri are unused.\n"
     );
-
-    exit(0); // generator must exit after showing the tutorial string
 }
 
 // the parser down below is made following these rules
@@ -73,7 +96,8 @@ void config_print_usage(void) {
 int config_parse_cli(GeneratorConfig* cfg, int argc, char** argv) {
     // helper enum for the long options who don't have a short option
     enum { // starting from a number where no ascii characters fall
-        OPT_BENIGN = 1000,
+        OPT_HELP = 1000,
+        OPT_BENIGN,
         OPT_SSH_BF,
         OPT_WEB_ATTACK,
         OPT_SUDO_ABUSE,
@@ -84,12 +108,17 @@ int config_parse_cli(GeneratorConfig* cfg, int argc, char** argv) {
         {"host", 1, 0, 'h'},
         {"port", 1, 0, 'p'},
         {"uri", 1, 0, 'u'},
+        {"output", 1, 0, 'o'},
         {"eps", 1, 0, 'e'},
         {"mode", 1, 0, 'm'},
         {"batch", 1, 0, 'b'},
         {"duration", 1, 0, 'd'},
+        {"count", 1, 0, 'n'},
+        {"write-time", 1, 0, 'w'},
+        {"pause", 1, 0, 'P'},
         {"verbose", 0, 0, 'v'}, // no value comes after this option
-        {"help", 0, 0, '?'}, // no value comes after this option
+        {"quiet", 0, 0, 'q'},
+        {"help", 0, 0, OPT_HELP},
         {"benign", 1, 0, OPT_BENIGN},
         {"ssh-bf", 1, 0, OPT_SSH_BF},
         {"web-attack", 1, 0, OPT_WEB_ATTACK},
@@ -99,8 +128,12 @@ int config_parse_cli(GeneratorConfig* cfg, int argc, char** argv) {
     };
 
     int idx = 0;
-    const char* short_options = "h:p:u:e:m:b:d:v";
+    bool count_option_set = false;
+    bool write_option_set = false;
+    const char* short_options = "h:p:u:o:e:m:b:d:n:w:P:vq?";
 
+    optind = 1;
+    opterr = 0;
     // check `man getopt_long` for details on the function usage
     int opt = getopt_long(argc, argv, short_options, options, &idx);
     while (opt != -1) {
@@ -147,16 +180,14 @@ int config_parse_cli(GeneratorConfig* cfg, int argc, char** argv) {
                     fprintf(stderr, "No uri given\n");
                     return -1; // abort
                 }
-
-                size_t size = strlen(optarg);
-                if (size >= TARGET_PATH_LEN) {
-                    fprintf(stderr, "URI too large\n");
+                break;
+            }
+            case 'o': {
+                if (!optarg || !optarg[0] || strlen(optarg) >= TARGET_PATH_LEN) {
+                    fprintf(stderr, "Invalid output path\n");
                     return -1;
                 }
-
-                // safely copy the target uri in the required config field
-                snprintf(cfg->target_path, sizeof(cfg->target_path), "%s",optarg);
-                cfg->target_path[size] = '\0'; // explicit null termination
+                snprintf(cfg->target_path, sizeof(cfg->target_path), "%s", optarg);
                 break;
             }
             case 'e': {
@@ -211,15 +242,41 @@ int config_parse_cli(GeneratorConfig* cfg, int argc, char** argv) {
                 cfg->duration_sec = (uint32_t)duration;
                 break;
             }
+            case 'n': {
+                if (parse_u32_arg(optarg, "log count", &cfg->total_logs) != 0) return -1;
+                count_option_set = true;
+                break;
+            }
+            case 'w': {
+                if (parse_u32_arg(optarg, "write time", &cfg->write_sec) != 0) return -1;
+                write_option_set = true;
+                break;
+            }
+            case 'P': {
+                if (parse_u32_arg(optarg, "pause duration", &cfg->pause_sec) != 0) return -1;
+                break;
+            }
             case 'v': { // no optarg for this
                 // turn thye verbosity flag true
                 cfg->verbosity = true;
                 break;
             }
-            case '?': { // no optarg for this
-                // print the usage tutorial
-                config_print_usage();
+            case 'q': {
+                cfg->verbosity = false;
                 break;
+            }
+            case OPT_HELP: {
+                config_print_usage();
+                return 1;
+            }
+            case '?': {
+                if (optind > 0 && strcmp(argv[optind - 1], "-?") == 0) {
+                    config_print_usage();
+                    return 1;
+                }
+                fprintf(stderr, "Unknown option or missing option value near \"%s\"\n",
+                        optind > 0 ? argv[optind - 1] : "");
+                return -1;
             }
             case OPT_BENIGN: {
                 if (!optarg) {
@@ -230,6 +287,10 @@ int config_parse_cli(GeneratorConfig* cfg, int argc, char** argv) {
                 // convert the string to unsigned long
                 unsigned long benign = strtoul(optarg, NULL, 10);
 
+                if (benign > 100) {
+                    fprintf(stderr, "Benign ratio must be between 0 and 100\n");
+                    return -1;
+                }
                 cfg->ratio_benign = (uint8_t)benign;
                 break;
             }
@@ -254,6 +315,10 @@ int config_parse_cli(GeneratorConfig* cfg, int argc, char** argv) {
                 // convert the string to unsigned long
                 unsigned long ssh = strtoul(optarg, NULL, 10);
 
+                if (ssh > 100) {
+                    fprintf(stderr, "SSH brute-force ratio must be between 0 and 100\n");
+                    return -1;
+                }
                 cfg->ratio_ssh_bf = (uint8_t)ssh;
                 break;
             }
@@ -266,6 +331,10 @@ int config_parse_cli(GeneratorConfig* cfg, int argc, char** argv) {
                 // convert the string to unsigned long
                 unsigned long sudo = strtoul(optarg, NULL, 10);
 
+                if (sudo > 100) {
+                    fprintf(stderr, "Sudo-abuse ratio must be between 0 and 100\n");
+                    return -1;
+                }
                 cfg->ratio_sudo_abuse = (uint8_t)sudo;
                 break;
             }
@@ -278,11 +347,41 @@ int config_parse_cli(GeneratorConfig* cfg, int argc, char** argv) {
                 // convert the string to unsigned long
                 unsigned long web = strtoul(optarg, NULL, 10);
 
+                if (web > 100) {
+                    fprintf(stderr, "Web attack ratio must be between 0 and 100\n");
+                    return -1;
+                }
                 cfg->ratio_web_attack = (uint8_t)web;
                 break;
             }
         }
         opt = getopt_long(argc, argv, short_options, options, &idx);
+    }
+
+    if (optind < argc) {
+        uint32_t logs;
+        uint32_t seconds;
+
+        if (argc - optind != 2 || count_option_set || write_option_set ||
+            parse_u32_arg(argv[optind], "number of logs", &logs) != 0 ||
+            parse_u32_arg(argv[optind + 1], "number of seconds", &seconds) != 0 ||
+            (logs == 0 && seconds == 0)) {
+            fprintf(stderr, "Usage: ./centinel_log_gen <number_of_logs> <number_of_seconds>\n");
+            return -1;
+        }
+        cfg->total_logs = logs;
+        cfg->write_sec = seconds;
+    }
+
+    if (cfg->pause_sec > 0) {
+        cfg->mode = MODE_BURST;
+    } else if (cfg->duration_sec > 0) {
+        if (cfg->write_sec == 0) {
+            cfg->write_sec = cfg->duration_sec;
+        } else if (cfg->write_sec != cfg->duration_sec) {
+            fprintf(stderr, "Conflicting --duration and --write-time values\n");
+            return -1;
+        }
     }
 
     return 0;
@@ -338,9 +437,8 @@ int config_validate(const GeneratorConfig* cfg) { // abort the program if this f
         return -1;
     }
 
-    // check the target path
-    if (cfg->target_path[0] != '/') {
-        fprintf(stderr, "URI must start with '/' (got \"%s\")\n", cfg->target_path);
+    if (cfg->target_path[0] == '\0') {
+        fprintf(stderr, "Output path cannot be empty\n");
         return -1;
     }
 
@@ -350,8 +448,20 @@ int config_validate(const GeneratorConfig* cfg) { // abort the program if this f
         return -1;
     }
 
-    // other validity checks if needed
-    
+    if (cfg->mode == MODE_BURST && cfg->pause_sec == 0) {
+        fprintf(stderr, "Pause mode requires --pause <seconds>\n");
+        return -1;
+    }
+    if (cfg->pause_sec > 0 && cfg->total_logs == 0 && cfg->write_sec == 0) {
+        fprintf(stderr, "Pause mode requires --count or --write-time to define a write window\n");
+        return -1;
+    }
+    if (cfg->total_logs > 0 && cfg->write_sec > 0 &&
+        (uint64_t)cfg->total_logs > (uint64_t)MAX_EPS * cfg->write_sec) {
+        fprintf(stderr, "%u logs in %u seconds exceeds the maximum rate of %d EPS\n",
+                cfg->total_logs, cfg->write_sec, MAX_EPS);
+        return -1;
+    }
 
     return 0;
 }
@@ -362,28 +472,46 @@ void config_dump(const GeneratorConfig* cfg) {
     // Print summary from here...
     // well, if the formatting is bad then it can be improved.
     printf("=============================================================================\n");
-    printf("    Target Path : %s\n", cfg->target_path);
-    printf("    Mode    : %s\n", mode_to_str(cfg->mode));
+    printf("    Output Path : %s\n", cfg->target_path);
+    printf("    Mode        : %s\n", mode_to_str(cfg->mode));
 
     if (cfg->mode == MODE_BENCHMARK) {
-        printf("    Target EPS  : unlimited\n"); // unlimited in CPU's capacity
+        printf("    Target EPS  : unlimited\n");
+    } else if (cfg->total_logs > 0 && cfg->write_sec > 0) {
+        printf("    Rate        : %u logs in %u s (%.2f logs/s)\n", cfg->total_logs,
+               cfg->write_sec, (double)cfg->total_logs / cfg->write_sec);
     } else {
         printf("    Target EPS  : %u\n", cfg->target_eps);
-    }   
+    }
+
+    if (cfg->total_logs > 0) {
+        printf("    Log count   : %u%s\n", cfg->total_logs,
+               cfg->pause_sec ? " per write window" : "");
+    }
+    if (cfg->write_sec > 0) {
+        printf("    Write time  : %u s%s\n", cfg->write_sec,
+               cfg->pause_sec ? " per window" : "");
+    }
+    if (cfg->pause_sec > 0) {
+        printf("    Pause       : %u s after each write window\n", cfg->pause_sec);
+        if (cfg->duration_sec > 0) {
+            printf("    Total time  : %u s\n", cfg->duration_sec);
+        } else {
+            printf("    Total time  : infinite (Ctrl+C to stop)\n");
+        }
+    } else if (cfg->total_logs > 0 && cfg->write_sec == 0) {
+        printf("    Duration    : until all logs are written\n");
+    } else if (cfg->write_sec == 0 && cfg->total_logs == 0) {
+        printf("    Duration    : infinite (Ctrl+C to stop)\n");
+    }
 
     printf("    Batch size  : %u\n", cfg->batch_size);
-
-    if (cfg->duration_sec == 0) {
-        printf("    Duration    : infinite (Ctrl+C to stop)\n");
-    } else {
-        printf("    Duration    : %u s\n", cfg->duration_sec);
-    }
 
     printf("    Traffic mix : benign %u%% | ssh-bf %u%% | web-attack %u%% | sudo-abuse %u%%\n",
            (unsigned)cfg->ratio_benign, (unsigned)cfg->ratio_ssh_bf,
            (unsigned)cfg->ratio_web_attack, (unsigned)cfg->ratio_sudo_abuse);
-    printf("    Attackers : %u unique IPs -> victim %s\n", cfg->attacker_ip_pool_size, cfg->victim_ip);
-    printf("    Verbose   : %s\n", cfg->verbosity ? "on" : "off");
+    printf("    Attackers   : %u unique IPs -> victim %s\n", cfg->attacker_ip_pool_size, cfg->victim_ip);
+    printf("    Verbose     : %s\n", cfg->verbosity ? "on" : "off");
     printf("=============================================================================\n");
     fflush(stdout);
 }
