@@ -4,7 +4,7 @@ void config_default_init(GeneratorConfig* cfg) {
     // zero out the struct memory first (full clear)
     memset(cfg, 0, sizeof(GeneratorConfig));
 
-    cfg->target_port = 1234;
+    cfg->target_port = 8080;
     cfg->target_eps = 1000;
     cfg->mode = MODE_CONTINUOUS;
     cfg->batch_size = 32;
@@ -26,8 +26,29 @@ void config_default_init(GeneratorConfig* cfg) {
 
 void config_print_usage(void) {
     // print the full usage tutorial here
-    printf("Log Generator Usage:\n");
+    printf("Centinel Log Generator\n");
     // code from here
+    printf(
+        "Usage: ./centinel_log_gen [OPTIONS]\n"
+        "Connection Options:\n"
+        "  -h, --host <string>       CWEB server host (Default: \"127.0.0.1\")\n"
+        "  -p, --port <int>          CWEB server port (Default: 8080)\n"
+        "  -u, --uri <string>        WebSocket path (Default: \"/ws/ingest\")\n"
+        "Load & Execution Options:\n"
+        "  -e, --eps <int>           Target events/sec (Default: 1000)\n"
+        "  -m, --mode <string>       \"continuous\", \"burst\", \"bench\"\n"
+        "  -b, --batch <int>         Batch flush size (Default: 32)\n"
+        "  -d, --duration <int>      Duration in seconds (0 = infinite)\n"
+        "Traffic Mix Options (Percentages):\n"
+        "      --benign <int>        Benign traffic %% (Default: 70)\n"
+        "      --ssh-bf <int>        SSH brute force %% (Default: 15)\n"
+        "      --web-attack <int>    Web exploit %% (Default: 10)\n"
+        "      --sudo-abuse <int>    Sudo abuse %% (Default: 5)\n"
+        "      --ip-pool <int>       Number of attacker IPs (Default: 10)\n"
+        "General Options:\n"
+        "  -v, --verbose             Enable verbose stdout logging\n"
+        "  -?, --help                Print formatted usage guide & exit\n"
+    );
 
     exit(0); // generator must exit after showing the tutorial string
 }
@@ -76,7 +97,8 @@ int config_parse_cli(GeneratorConfig* cfg, int argc, char** argv) {
         {"ssh-bf", 1, 0, OPT_SSH_BF},
         {"web-attack", 1, 0, OPT_WEB_ATTACK},
         {"sudo-abuse", 1, 0, OPT_SUDO_ABUSE},
-        {"ip-pool", 1, 0, OPT_IP_POOL}
+        {"ip-pool", 1, 0, OPT_IP_POOL},
+        {0, 0, 0, 0}   // centinel: tells getopt_long where the table ends to avoid Undefined Behaviour (UB)
     };
 
     int idx = 0;
@@ -269,7 +291,23 @@ int config_parse_cli(GeneratorConfig* cfg, int argc, char** argv) {
     return 0;
 }
 
+// helper function to convert mode into string
+static const char* mode_to_str(GeneratorMode mode) {
+    switch (mode) {
+        case MODE_CONTINUOUS: return "continuous";
+        case MODE_BURST:      return "burst";
+        case MODE_BENCHMARK:  return "benchmark (unthrottled)";
+    }
+    return "unknown";
+}
+
 int config_validate(const GeneratorConfig* cfg) { // abort the program if this function returns -1
+    // check NULL
+    if (cfg == NULL) {
+        fprintf(stderr, "Config is null.\n");
+        return -1;
+    }
+
     // events per second validation
     if (cfg->target_eps == 0 || cfg->target_eps > MAX_EPS) {
         fprintf(stderr, "EPS out of allowed range\n");
@@ -283,18 +321,66 @@ int config_validate(const GeneratorConfig* cfg) { // abort the program if this f
     }
 
     // ratio sum validation
-    if (cfg->ratio_benign + cfg->ratio_ssh_bf + cfg->ratio_sudo_abuse + cfg->ratio_web_attack != 100) {
-        fprintf(stderr, "Ratio sum does not equal to 100 percent\n");
+    int ratio_sum = cfg->ratio_benign + cfg->ratio_ssh_bf + cfg->ratio_sudo_abuse + cfg->ratio_web_attack;
+    if (ratio_sum != 100) {
+        fprintf(stderr, "Ratio sum must be equal to 100 percent (got %d)\n", ratio_sum);
         return -1;
     }
 
-    // add some more validation logic such as for IP here...
+    // check if the host ip is correct (ipv4 format)
+    struct in_addr addr;
+    if (inet_pton(AF_INET, cfg->target_host, &addr) != 1) {
+        fprintf(stderr, "Invalid target host \"%s\"\n", cfg->target_host);
+        return -1;
+    }
+
+    // check if the victim is correct (ipv4 format)
+    struct in_addr victim;
+    if (inet_pton(AF_INET, cfg->victim_ip, &victim) != 1) {
+        fprintf(stderr, "Invalid victim IP \"%s\"\n", cfg->victim_ip);
+        return -1;
+    }
+
+    // check the target path
+    if (cfg->target_path[0] != '/') {
+        fprintf(stderr, "URI must start with '/' (got \"%s\")\n", cfg->target_path);
+        return -1;
+    }
+
+    // other validity checks if needed
+    
 
     return 0;
 }
 
 void config_dump(const GeneratorConfig* cfg) {
     // Print generator config summary here on startup
-    printf("Sentinel SIEM - High Performance VPS Attack Log Generator\n");
+    printf("Centinel SIEM - High Performance VPS Attack Log Generator\n");
     // Print summary from here...
+    // well, if the formatting is bad then it can be improved.
+    printf("=============================================================================\n");
+    printf("    Target  : ws://%s:%u%s\n", cfg->target_host, (unsigned)cfg->target_port, cfg->target_path);
+    printf("    Mode    : %s\n", mode_to_str(cfg->mode));
+
+    if (cfg->mode == MODE_BENCHMARK) {
+        printf("    Target EPS  : unlimited\n"); // unlimited in CPU's capacity
+    } else {
+        printf("    Target EPS  : %u\n", cfg->target_eps);
+    }   
+
+    printf("    Batch size  : %u\n", cfg->batch_size);
+
+    if (cfg->duration_sec == 0) {
+        printf("    Duration    : infinite (Ctrl+C to stop)\n");
+    } else {
+        printf("    Duration    : %u s\n", cfg->duration_sec);
+    }
+
+    printf("    Traffic mix : benign %u%% | ssh-bf %u%% | web-attack %u%% | sudo-abuse %u%%\n",
+           (unsigned)cfg->ratio_benign, (unsigned)cfg->ratio_ssh_bf,
+           (unsigned)cfg->ratio_web_attack, (unsigned)cfg->ratio_sudo_abuse);
+    printf("    Attackers : %u unique IPs -> victim %s\n", cfg->attacker_ip_pool_size, cfg->victim_ip);
+    printf("    Verbose   : %s\n", cfg->verbosity ? "on" : "off");
+    printf("=============================================================================\n");
+    fflush(stdout);
 }
