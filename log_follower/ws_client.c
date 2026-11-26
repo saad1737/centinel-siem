@@ -14,6 +14,10 @@ void ws_client_init(WsClient* ws, const char* host, int port, const char* path) 
     ws->backoff_delay_sec = 1;
     ws->next_reconnect = 0;
     ws->last_activity = 0;
+    ws->handshake_len = 0;
+    ws->send_len = 0;
+    ws->send_offset = 0;
+    ws->awaiting_ack = false;
 }
 
 void ws_client_destroy(WsClient* ws, int epoll_fd) {
@@ -84,6 +88,12 @@ void ws_client_disconnect(WsClient* ws, int epoll_fd) {
     ws->next_reconnect = time(NULL) + ws->backoff_delay_sec;
     fprintf(stderr, "[WS] Disconnected. Reconnecting in %d seconds...\n", ws->backoff_delay_sec);
     ws->backoff_delay_sec = (ws->backoff_delay_sec * 2 > 30) ? 30 : ws->backoff_delay_sec * 2;
+
+    // reset transmission
+    ws->handshake_len = 0;
+    ws->send_len = 0;
+    ws->send_offset = 0;
+    ws->awaiting_ack = false;
 }
 
 void ws_client_handle_event(WsClient* ws, uint32_t events, int epoll_fd) {
@@ -169,34 +179,50 @@ void ws_client_handle_event(WsClient* ws, uint32_t events, int epoll_fd) {
             ws->handshake_len = 0;
             ws->last_activity = time(NULL);
             printf("[WS] Connected to CWEB SIEM at ws://%s:%d%s\n", ws->host, ws->port, ws->path);
+            fflush(stdout);
 
             break;
         }
 
         case WS_STATE_CONNECTED: {
+            if (events & EPOLLOUT) {
+                if (ws_client_flush_pending(ws, epoll_fd) < 0) return;
+            }
             if (!(events & EPOLLIN)) return;
-            // small buffer
+
             char buf[256];
             ssize_t n = read(ws->sock_fd, buf, sizeof(buf));
             if (n <= 0) {
-                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return; // do not disconnect
+                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
                 ws_client_disconnect(ws, epoll_fd);
                 return;
             }
 
-            // check frame opcode
-            uint8_t opcode = (uint8_t)buf[0] & 0x0F;
-            if (opcode == WS_OP_CLOSE) {
-                // disconnect
-                ws_client_disconnect(ws, epoll_fd);
-                return;
+            // Walk all frames received in buf (e.g., coalesced ACK + PONG)
+            size_t pos = 0;
+            while (pos + 2 <= (size_t)n) {
+                uint8_t opcode = (uint8_t)buf[pos] & 0x0F;
+                size_t plen = (uint8_t)buf[pos + 1] & 0x7F;
+                size_t hdr = 2;
+                if (plen == 126) {
+                    if (pos + 4 > (size_t)n) break;
+                    plen = ((uint8_t)buf[pos + 2] << 8) | (uint8_t)buf[pos + 3];
+                    hdr = 4;
+                }
+                if (opcode == WS_OP_CLOSE) {
+                    ws_client_disconnect(ws, epoll_fd);
+                    return;
+                } 
+                else if (opcode == WS_OP_PONG) {
+                    ws->last_activity = time(NULL);
+                } 
+                else if (opcode == WS_OP_TEXT) {
+                    ws->last_activity = time(NULL);
+                    ws->awaiting_ack = false; // Server ACK received: safe to send next chunk
+                }
+                if (pos + hdr + plen > (size_t)n) break;
+                pos += hdr + plen;
             }
-            else if (opcode == WS_OP_PONG) {
-                // pong from cweb
-                ws->last_activity = time(NULL);
-                return;
-            }
-
             break;
         }
 
@@ -204,26 +230,54 @@ void ws_client_handle_event(WsClient* ws, uint32_t events, int epoll_fd) {
     }
 }
 
-ssize_t ws_client_send_chunk(WsClient* ws, const char* data, size_t len, int epoll_fd) {
-    if (!ws || !data) return -1; // invalid arguments
+static int ws_set_epoll_events(int sock_fd, int epoll_fd, uint32_t events) {
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.events = events;
+    ev.data.fd = sock_fd;
+    return epoll_ctl(epoll_fd, EPOLL_CTL_MOD, sock_fd, &ev);
+}
 
-    if (ws->state != WS_STATE_CONNECTED) return -1;
+int ws_client_flush_pending(WsClient* ws, int epoll_fd) {
+    if (!ws || ws->state != WS_STATE_CONNECTED) return -1;
+    if (ws->send_len == 0) return 1;
 
-    // allocate frame buffer
-    uint8_t frame_buf[len + 16];
-    // encode frame
-    size_t masked_frame_len = ws_encode_frame(WS_OP_TEXT, data, len, frame_buf, sizeof(frame_buf));
-
-    // send over socket
-    ssize_t written = write(ws->sock_fd, frame_buf, masked_frame_len);
-    if (written > 0) {
-        ws->last_activity = time(NULL);
-    } 
-    else if (written < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-        ws_client_disconnect(ws, epoll_fd); // Handle connection loss
+    while (ws->send_offset < ws->send_len) {
+        ssize_t n = write(ws->sock_fd, ws->send_buf + ws->send_offset, ws->send_len - ws->send_offset);
+        if (n > 0) {
+            ws->send_offset += (size_t)n;
+            ws->last_activity = time(NULL);
+        } 
+        else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            // Socket buffer full: ask epoll for EPOLLOUT and resume later without losing bytes
+            ws_set_epoll_events(ws->sock_fd, epoll_fd, EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP);
+            return 0;
+        } 
+        else {
+            ws_client_disconnect(ws, epoll_fd);
+            return -1;
+        }
     }
 
-    return written;
+    // Full frame transmitted! Stop watching EPOLLOUT, arm Stop-and-Wait ACK
+    ws_set_epoll_events(ws->sock_fd, epoll_fd, EPOLLIN | EPOLLERR | EPOLLHUP);
+    ws->send_len = 0;
+    ws->send_offset = 0;
+    ws->awaiting_ack = true;
+    return 1;
+}
+
+ssize_t ws_client_send_chunk(WsClient* ws, const char* data, size_t len, int epoll_fd) {
+    if (!ws || !data || len == 0) return -1;
+    if (ws->state != WS_STATE_CONNECTED || ws->send_len > 0 || ws->awaiting_ack) return 0;
+
+    size_t frame_len = ws_encode_frame(WS_OP_TEXT, data, len, ws->send_buf, sizeof(ws->send_buf));
+    if (frame_len == 0) return -1; // Frame exceeded send_buf
+
+    ws->send_len = frame_len;
+    ws->send_offset = 0;
+    int fl = ws_client_flush_pending(ws, epoll_fd);
+    return (fl < 0) ? -1 : 1;
 }
 
 void ws_client_tick(WsClient* ws, int epoll_fd) {
@@ -239,14 +293,21 @@ void ws_client_tick(WsClient* ws, int epoll_fd) {
     }
 
     // CWEB 2.5s Heartbeat Ping
+    // CWEB Keep-Alive & Stalled-ACK Watchdog
     if (ws->state == WS_STATE_CONNECTED) {
+        if (ws->send_len > 0 || ws->awaiting_ack) {
+            if (now - ws->last_activity >= 10) {
+                ws_client_disconnect(ws, epoll_fd);
+            }
+            return;
+        }
         if (now - ws->last_activity >= 2) {
             uint8_t ping_buf[16];
             size_t ping_len = ws_encode_frame(WS_OP_PING, NULL, 0, ping_buf, sizeof(ping_buf));
-            if (write(ws->sock_fd, ping_buf, ping_len) > 0) {
+            ssize_t w = write(ws->sock_fd, ping_buf, ping_len);
+            if (w > 0) {
                 ws->last_activity = now;
-            } 
-            else {
+            } else if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
                 ws_client_disconnect(ws, epoll_fd);
             }
         }

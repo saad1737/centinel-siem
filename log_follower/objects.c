@@ -502,41 +502,37 @@ void follower_catchup_all(FollowerContext* ctx) {
 }
 
 size_t follower_drain_queue(FollowerContext* ctx, size_t max_chunks) {
+    (void)max_chunks; // Stop-and-Wait sends 1 chunk per ACK to keep CWEB single-frame clean
     if (!ctx || ctx->queue.count == 0) return 0;
+    if (ctx->ws.state != WS_STATE_CONNECTED) return 0;
 
-    if (ctx->ws.state != WS_STATE_CONNECTED) return 0; // do not drain while client is not connected to the server
+    // Finish any partial write in flight before starting a new chunk
+    if (ctx->ws.send_len > 0) {
+        if (ws_client_flush_pending(&ctx->ws, ctx->epoll_fd) <= 0) return 0;
+    }
 
-    // drain the queue
-    size_t drained = 0;
-    while (ctx->queue.count && (max_chunks == 0 || drained < max_chunks)) {
-        LogChunk* chunk = chunk_queue_pop(&ctx->queue);
-        if (!chunk) break;
+    // Do not pipeline a second frame while CWEB hasn't ACKed the previous one
+    if (ctx->ws.awaiting_ack) return 0;
 
-        // simulate transmission (for now)
-        // printf("=== [CONSUMER TRANSMIT: %zu records, %zu bytes | Queue remaining: %zu] ===\n", chunk->record_count, chunk->length, ctx->queue.count);
-        // fwrite(chunk->data, sizeof(char), chunk->length, stdout);
-        // fflush(stdout);
+    LogChunk* chunk = chunk_queue_peek(&ctx->queue);
+    if (!chunk) return 0;
 
-        // send the chunk
-        ssize_t sent = ws_client_send_chunk(&ctx->ws, chunk->data, chunk->length, ctx->epoll_fd);
-        if (sent < 0) {
-            // Socket dropped or kernel buffer full; re-enqueue or handle failure
-            chunk_queue_push(&ctx->queue, chunk);
-            return 0; // try again
-        }
+    ssize_t res = ws_client_send_chunk(&ctx->ws, chunk->data, chunk->length, ctx->epoll_fd);
+    if (res < 0) return 0;
 
-        // destroy transmitted chunk
+    // Note: even if res == 0 (partial write), the entire frame is now buffered inside ws->send_buf,
+    if (res == 1) {
+        chunk_queue_pop(&ctx->queue);
         log_chunk_destroy(chunk);
-        drained++;
+
+        if (ctx->is_paused && ctx->queue.count <= QUEUE_LOW_WATERMARK) {
+            ctx->is_paused = false;
+            fprintf(stderr, "[BACKPRESSURE RELEASED] Queue dropped to %zu chunks (<= low watermark %d). Resuming disk ingestion.\n",
+                    ctx->queue.count, QUEUE_LOW_WATERMARK);
+            follower_catchup_all(ctx);
+        }
+        return 1;
     }
 
-    // release backpressure and trigger catch-up
-    if (ctx->is_paused && ctx->queue.count <= QUEUE_LOW_WATERMARK) {
-        ctx->is_paused = false;
-        fprintf(stderr, "[BACKPRESSURE RELEASED] Queue dropped to %zu chunks (<= low watermark %d). Resuming disk ingestion.\n",
-                ctx->queue.count, QUEUE_LOW_WATERMARK);
-        follower_catchup_all(ctx);
-    }
-
-    return drained;
+    return 0;
 }

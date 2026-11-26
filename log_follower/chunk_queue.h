@@ -36,6 +36,9 @@ size_t chunk_queue_count(const ChunkQueue* q);
 /* Checks if queue has hit the high watermark */
 bool chunk_queue_is_full(const ChunkQueue* q);
 
+/* Returns pointer to the oldest chunk without removing it, or NULL if empty */
+LogChunk* chunk_queue_peek(const ChunkQueue* q);
+
 /* Frees any remaining chunks inside the queue on shutdown */
 void chunk_queue_destroy(ChunkQueue* q);
 

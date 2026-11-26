@@ -44,6 +44,11 @@ bool chunk_queue_is_full(const ChunkQueue* q) {
     return q->count >= QUEUE_HIGH_WATERMARK;
 }
 
+LogChunk* chunk_queue_peek(const ChunkQueue* q) {
+    if (!q || q->count == 0) return NULL;
+    return q->entries[q->head];
+}
+
 void chunk_queue_destroy(ChunkQueue* q) {
     if (!q) return;
 

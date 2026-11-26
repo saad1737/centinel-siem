@@ -1,4 +1,5 @@
 #include "log_follower.h"
+#include <stdlib.h>
 
 static volatile sig_atomic_t keep_running = 1;
 
@@ -54,7 +55,10 @@ void drain_file(FollowerContext* ctx, Trackedfile* file) {
 
             if (log_chunk_append(ctx->active_chunk, record, (size_t)rec_len) == 1) {
                 follower_seal_active_chunk(ctx);
-                log_chunk_append(ctx->active_chunk, record, (size_t)rec_len);
+                if (log_chunk_append(ctx->active_chunk, record, (size_t)rec_len) != 0) {
+                    ctx->is_paused = true;
+                    break; // Do NOT advance start; leftover preserves this line in file->buffer
+                }
             }
 
             file->offset += file->buf_len;
@@ -101,7 +105,10 @@ void drain_file(FollowerContext* ctx, Trackedfile* file) {
                 // Append into active chunk (seal chunk if full)
                 if (log_chunk_append(ctx->active_chunk, record, (size_t)rec_len) == 1) {
                     follower_seal_active_chunk(ctx);
-                    log_chunk_append(ctx->active_chunk, record, (size_t)rec_len);
+                    if (log_chunk_append(ctx->active_chunk, record, (size_t)rec_len) != 0) {
+                        ctx->is_paused = true;
+                        break; // Do NOT advance start; leftover preserves this line in file->buffer
+                    }
                 }
 
                 start = i + 1;
@@ -236,6 +243,7 @@ int main(int argc, char** argv) {
     FollowerContext* ctx = follower_init(&config);
     if (!ctx) {
         fprintf(stderr, "Follower Context creation failed\n");
+        return EXIT_FAILURE;
     }
 
     // add the target files
@@ -281,6 +289,9 @@ int main(int argc, char** argv) {
             // Ws socket eent
             else if  (events[i].data.fd == ctx->ws.sock_fd) {
                 ws_client_handle_event(&ctx->ws, events[i].events, ctx->epoll_fd);
+                if (ctx->ws.state == WS_STATE_CONNECTED && !ctx->ws.awaiting_ack && ctx->ws.send_len == 0) {
+                    follower_drain_queue(ctx, 1);
+                }
             }
 
             // Inotify File Events Fired
@@ -310,6 +321,7 @@ int main(int argc, char** argv) {
                             if (fstat(file->fd, &st) == 0) {
                                 if (st.st_size < file->offset) {
                                     file->offset = 0;
+                                    file->buf_len = 0;
                                     lseek(file->fd, 0, SEEK_SET);
                                     checkpoint_save(ctx->checkpoint_fd, file->dev, file->inode, 0);
                                 }
@@ -328,6 +340,7 @@ int main(int argc, char** argv) {
                             close(file->fd);
                             file->fd = -1;
                             file->is_active = false;
+                            file->buf_len = 0;
                         }
                     }
                     // Check if this is a Directory Event
@@ -431,6 +444,7 @@ int main(int argc, char** argv) {
                                         target_file->fd = -1;
                                     }
 
+                                    target_file->buf_len = 0;
                                     target_file->is_active = false;
                                 }
                             }

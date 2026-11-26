@@ -38,6 +38,12 @@ typedef struct {
     // Handshake reception buffer
     char handshake_buf[1024];
     size_t handshake_len;
+
+    // In-flight frame buffer & Stop-and-Wait ACK pacing (protects CWEB's 16KB recv buffer)
+    uint8_t send_buf[16384]; // 16 KB same as CWEB's buffer size
+    size_t send_len;
+    size_t send_offset;
+    bool awaiting_ack;
 } WsClient;
 
 // Lifecycle
@@ -52,5 +58,6 @@ void ws_client_tick(WsClient* ws, int epoll_fd); // Called every 500ms by reacto
 
 // Transmission
 ssize_t ws_client_send_chunk(WsClient* ws, const char* data, size_t len, int epoll_fd);
+int ws_client_flush_pending(WsClient* ws, int epoll_fd); // Returns 1 if finished, 0 if EAGAIN, -1 on error
 
 #endif
