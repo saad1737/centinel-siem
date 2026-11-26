@@ -1,2 +1,4 @@
 log_datasets
-/log_generator/sentinel_log_gen
+/log_generator/centinel_log_gen
+/log_follower/centinel_log_fol
+/cweb_engine/centinel-engine
